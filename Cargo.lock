@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "ai-trash"
+version = "1.0.0"
+dependencies = [
+ "trash",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -223,13 +230,6 @@ dependencies = [
  "scopeguard",
  "urlencoding",
  "windows",
-]
-
-[[package]]
-name = "trash-cli"
-version = "1.0.0"
-dependencies = [
- "trash",
 ]
 
 [[package]]
