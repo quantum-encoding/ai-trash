@@ -1,0 +1,22 @@
+[package]
+name = "trash-cli"
+version = "1.0.0"
+edition = "2024"
+description = "Move files to system trash — safe alternative to rm. Works with Claude Code deny policies."
+license = "MIT"
+repository = "https://github.com/quantum-encoding/trash-cli"
+keywords = ["trash", "recycle-bin", "delete", "cli", "claude-code"]
+categories = ["command-line-utilities", "filesystem"]
+
+[[bin]]
+name = "trash"
+path = "src/main.rs"
+
+[dependencies]
+trash = "5"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
