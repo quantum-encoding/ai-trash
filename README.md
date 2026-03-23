@@ -25,11 +25,11 @@ AI coding agents (Claude Code, Cursor, etc.) execute shell commands. A misplaced
 
 ### From source (any platform)
 ```bash
-cargo install --git https://github.com/quantum-encoding/trash-cli
+cargo install --git https://github.com/quantum-encoding/ai-trash
 ```
 
 ### Pre-built binaries
-Download from [Releases](https://github.com/quantum-encoding/trash-cli/releases):
+Download from [Releases](https://github.com/quantum-encoding/ai-trash/releases):
 - `trash-macos-arm64` (Apple Silicon)
 - `trash-macos-x64` (Intel Mac)
 - `trash-linux-x64` (Linux x86_64)

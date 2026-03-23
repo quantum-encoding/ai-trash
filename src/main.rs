@@ -150,6 +150,6 @@ PLATFORMS:
     Linux    freedesktop.org trash spec (~/.local/share/Trash)
 
 Designed for Claude Code: block `rm` in deny policies, allow `trash`.
-https://github.com/quantum-encoding/trash-cli"
+https://github.com/quantum-encoding/ai-trash"
     );
 }
