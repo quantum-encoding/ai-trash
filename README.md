@@ -35,7 +35,7 @@ Download from [Releases](https://github.com/quantum-encoding/ai-trash/releases):
 - `trash-linux-x64` (Linux x86_64)
 - `trash-windows-x64.exe` (Windows)
 
-### Homebrew (coming soon)
+### Homebrew (macOS)
 ```bash
 brew install quantum-encoding/tap/trash-cli
 ```
