@@ -37,7 +37,7 @@ Download from [Releases](https://github.com/quantum-encoding/ai-trash/releases):
 
 ### Homebrew (macOS)
 ```bash
-brew install quantum-encoding/tap/trash-cli
+brew install quantum-encoding/tap/ai-trash
 ```
 
 ## Usage
