@@ -34,34 +34,103 @@ unsafe extern "C" {
     fn rmdir(path: *const i8) -> i32;
 }
 
-fn libc_rename(from: &Path, to: &Path) -> io::Result<()> {
+// Atomic rename that refuses to overwrite an existing destination.
+// macOS: renameatx_np(RENAME_EXCL); Linux: renameat2(RENAME_NOREPLACE).
+// This closes H-3 (exists()->rename TOCTOU) and the overwrite half of H-1.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn renameatx_np(fromfd: i32, from: *const i8, tofd: i32, to: *const i8, flags: u32) -> i32;
+}
+#[cfg(target_os = "macos")]
+const AT_FDCWD: i32 = -2;
+#[cfg(target_os = "macos")]
+const RENAME_EXCL: u32 = 0x0000_0004;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn renameat2(olddirfd: i32, oldpath: *const i8, newdirfd: i32, newpath: *const i8, flags: u32) -> i32;
+}
+#[cfg(target_os = "linux")]
+const AT_FDCWD: i32 = -100;
+#[cfg(target_os = "linux")]
+const RENAME_NOREPLACE: u32 = 1;
+
+/// Rename `from` -> `to`, failing (EEXIST) rather than overwriting an
+/// existing `to`. The existence check is atomic with the rename, so there
+/// is no TOCTOU window and a symlink at `to` cannot be followed to clobber
+/// its target.
+#[cfg(not(target_os = "windows"))]
+fn libc_rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let from_c = path_to_cstring(from)?;
     let to_c = path_to_cstring(to)?;
-    if unsafe { rename(from_c.as_ptr(), to_c.as_ptr()) } == 0 {
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { renameatx_np(AT_FDCWD, from_c.as_ptr(), AT_FDCWD, to_c.as_ptr(), RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { renameat2(AT_FDCWD, from_c.as_ptr(), AT_FDCWD, to_c.as_ptr(), RENAME_NOREPLACE) };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let rc = {
+        // Fallback for other Unixes without renameat2/renameatx_np: best-effort
+        // link+unlink is not atomic across filesystems, so fall back to a
+        // plain rename only after a non-atomic existence check.
+        if to.symlink_metadata().is_ok() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
+        }
+        let from_c2 = path_to_cstring(from)?;
+        let to_c2 = path_to_cstring(to)?;
+        unsafe { rename(from_c2.as_ptr(), to_c2.as_ptr()) }
+    };
+    if rc == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
 }
 
+/// Maximum directory recursion depth for `libc_remove` (L-3: bound the walk
+/// so a pathologically deep trashed tree can't blow the thread stack).
+const MAX_REMOVE_DEPTH: u32 = 256;
+
 fn libc_remove(path: &Path) -> io::Result<()> {
-    let path_c = path_to_cstring(path)?;
-    if unsafe { unlink(path_c.as_ptr()) } == 0 {
-        return Ok(());
+    libc_remove_depth(path, 0)
+}
+
+fn libc_remove_depth(path: &Path, depth: u32) -> io::Result<()> {
+    if depth > MAX_REMOVE_DEPTH {
+        return Err(io::Error::other("trash: max recursion depth exceeded"));
     }
-    // If unlink fails (might be a directory), try rmdir
+
+    // H-2: decide what this entry IS from the link itself, never from a
+    // resolved target. `is_dir()` follows symlinks; `symlink_metadata` does
+    // not. A symlink (even one pointing at a directory) is unlinked as a
+    // link and never recursed into, so `trash empty` can never delete files
+    // outside the trash by walking through a planted symlink.
+    let md = fs::symlink_metadata(path)?;
+    let ft = md.file_type();
+
+    if !ft.is_dir() {
+        // Regular file, symlink, socket, fifo, device: remove the entry itself.
+        // unlink() never follows the final symlink, so this removes the link.
+        let path_c = path_to_cstring(path)?;
+        if unsafe { unlink(path_c.as_ptr()) } == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
+    }
+
+    // Confirmed a real directory (not a symlink to one). Try the cheap
+    // rmdir first (empty dir), then recurse.
+    let path_c = path_to_cstring(path)?;
     if unsafe { rmdir(path_c.as_ptr()) } == 0 {
         return Ok(());
     }
-    // Non-empty directory — recurse
-    if path.is_dir() {
-        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
-            libc_remove(&entry.path()).ok();
-        }
-        let path_c = path_to_cstring(path)?;
-        if unsafe { rmdir(path_c.as_ptr()) } == 0 {
-            return Ok(());
-        }
+    // read_dir on a verified-real directory does not traverse a symlink at
+    // `path`. Each child is re-checked via symlink_metadata on the recursion.
+    for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+        libc_remove_depth(&entry.path(), depth + 1).ok();
+    }
+    let path_c = path_to_cstring(path)?;
+    if unsafe { rmdir(path_c.as_ptr()) } == 0 {
+        return Ok(());
     }
     Err(io::Error::last_os_error())
 }
@@ -73,28 +142,47 @@ fn path_to_cstring(path: &Path) -> io::Result<CString> {
 
 // ── Platform helpers ────────────────────────────────────────────────
 
+/// Validate `$HOME` once and return it. Errors if unset or not absolute.
+/// Called by `main` up front so the whole process refuses to run with an
+/// unsafe HOME rather than silently falling back to world-writable `/tmp`
+/// (M-3), where any local user could pre-plant symlinks to weaponize
+/// H-1/H-2 against the next invocation.
+#[cfg(not(target_os = "windows"))]
+fn validate_home() -> Result<PathBuf, String> {
+    match std::env::var("HOME") {
+        Ok(h) if Path::new(&h).is_absolute() => Ok(PathBuf::from(h)),
+        Ok(h) if h.is_empty() => Err("HOME is empty".into()),
+        Ok(_) => Err("HOME is not an absolute path".into()),
+        Err(_) => Err("HOME is unset".into()),
+    }
+}
+
+/// The user's home directory. `main` validates HOME before any trash path is
+/// computed, so this read cannot fall through to `/tmp`; if the invariant is
+/// ever violated it panics loudly rather than touching a shared directory.
+#[cfg(not(target_os = "windows"))]
+fn home_base() -> PathBuf {
+    validate_home().expect("HOME is validated at startup (see main)")
+}
+
 #[cfg(target_os = "macos")]
 fn trash_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".Trash")
+    home_base().join(".Trash")
 }
 
 #[cfg(target_os = "linux")]
 fn trash_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".local/share/Trash/files")
+    home_base().join(".local/share/Trash/files")
 }
 
 #[cfg(target_os = "macos")]
 fn info_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".Trash/.trash-metadata")
+    home_base().join(".Trash/.trash-metadata")
 }
 
 #[cfg(target_os = "linux")]
 fn info_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".local/share/Trash/info")
+    home_base().join(".local/share/Trash/info")
 }
 
 // ── Trash entry ─────────────────────────────────────────────────────
@@ -173,15 +261,27 @@ fn percent_decode(s: &str) -> String {
 fn parse_iso_datetime(s: &str) -> Option<SystemTime> {
     // Format: YYYY-MM-DDTHH:MM:SS
     let s = s.trim();
-    if s.len() < 19 {
-        return None;
+    // M-2: operate on bytes, not char slices. `s[0..4]` panics if a crafted
+    // DeletionDate places a multi-byte UTF-8 boundary inside the range (the
+    // `s.len() < 19` guard only checks byte length), which would abort every
+    // `trash list` run because one poisoned .trashinfo exists. Fixed-offset
+    // fields are ASCII digits by spec; extract them safely.
+    let b = s.as_bytes();
+    // Reads an unsigned integer from ASCII digits in b[start..end], or None.
+    fn field(b: &[u8], start: usize, end: usize) -> Option<u64> {
+        let slice = b.get(start..end)?;
+        if slice.is_empty() || !slice.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        // ASCII digits only — from_utf8 cannot fail.
+        std::str::from_utf8(slice).ok()?.parse().ok()
     }
-    let year: u64 = s[0..4].parse().ok()?;
-    let month: u64 = s[5..7].parse().ok()?;
-    let day: u64 = s[8..10].parse().ok()?;
-    let hour: u64 = s[11..13].parse().ok()?;
-    let min: u64 = s[14..16].parse().ok()?;
-    let sec: u64 = s[17..19].parse().ok()?;
+    let year = field(b, 0, 4)?;
+    let month = field(b, 5, 7)?;
+    let day = field(b, 8, 10)?;
+    let hour = field(b, 11, 13)?;
+    let min = field(b, 14, 16)?;
+    let sec = field(b, 17, 19)?;
 
     // Approximate: days from epoch to date
     let mut days: u64 = 0;
@@ -222,23 +322,53 @@ fn write_trash_info(trash_filename: &str, original_path: &Path) -> io::Result<()
     fs::write(info_path, content)
 }
 
-/// Current local time as ISO string (best-effort, no TZ crate).
-#[cfg(target_os = "macos")]
+/// Current UTC time as an ISO-8601 string `YYYY-MM-DDTHH:MM:SS`.
+///
+/// M-1: the previous implementation shelled out to `Command::new("date")`
+/// with a bare program name, so a PATH containing an attacker-writable
+/// directory before `/bin` would run a hijacked `date` (whose output lands
+/// in the .trashinfo DeletionDate) with the user's privileges on every
+/// trash. This computes the timestamp inline — no subprocess, no PATH
+/// dependency. It also emits UTC, which is what `parse_iso_datetime` already
+/// assumes, fixing the prior write-local / read-as-UTC inconsistency that
+/// skewed `--older` age filtering by the local UTC offset.
+#[cfg(not(target_os = "windows"))]
 fn now_iso() -> String {
-    // Use system `date` for correct local time without extra deps
-    let output = std::process::Command::new("date")
-        .arg("+%Y-%m-%dT%H:%M:%S")
-        .output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
-            // Fallback: seconds since epoch formatted roughly
-            let d = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            format!("epoch+{}", d.as_secs())
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_iso_utc(secs)
+}
+
+/// Format seconds-since-epoch as `YYYY-MM-DDTHH:MM:SS` in UTC.
+/// Inverse of `parse_iso_datetime`; shared so the round trip is exact.
+#[cfg(not(target_os = "windows"))]
+fn format_iso_utc(secs: u64) -> String {
+    let mut days = secs / 86400;
+    let rem = secs % 86400;
+    let (hour, min, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    let mut year: u64 = 1970;
+    loop {
+        let year_days = if is_leap(year) { 366 } else { 365 };
+        if days < year_days {
+            break;
         }
+        days -= year_days;
+        year += 1;
     }
+    let month_days = [31, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1usize;
+    for (i, &md) in month_days.iter().enumerate() {
+        if days < md {
+            month = i + 1;
+            break;
+        }
+        days -= md;
+    }
+    let day = days + 1;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}")
 }
 
 // ── Age parsing ─────────────────────────────────────────────────────
@@ -765,11 +895,19 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         matches[choice]
     };
 
-    // Determine target path
-    let target = if let Some(ref to) = restore_to {
-        PathBuf::from(to)
+    // Determine target path. `from_metadata` marks the attacker-influenceable
+    // branch (original_path came from a .trashinfo file).
+    let (target, from_metadata) = if let Some(ref to) = restore_to {
+        // User-supplied destination: make it absolute relative to cwd.
+        let p = PathBuf::from(to);
+        let abs = if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().unwrap_or_default().join(p)
+        };
+        (abs, false)
     } else if !chosen.original_path.is_empty() {
-        PathBuf::from(&chosen.original_path)
+        (PathBuf::from(&chosen.original_path), true)
     } else {
         eprintln!(
             "trash restore: no original path for '{}' — use --to <path>",
@@ -778,15 +916,30 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    // Check target doesn't exist
-    if target.exists() {
+    // H-1: the original_path is decoded from a .trashinfo file that any
+    // same-UID writer could have crafted. Reject traversal / non-absolute /
+    // NUL before renaming trashed bytes onto it.
+    if from_metadata {
+        if let Err(why) = validate_restore_target(&target) {
+            eprintln!(
+                "trash restore: refusing unsafe restore path ({why}): {}",
+                target.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    // Friendly pre-check. symlink_metadata (not exists) so a dangling symlink
+    // at the target is also treated as "occupied". The authoritative guard is
+    // the atomic no-replace rename below.
+    if target.symlink_metadata().is_ok() {
         eprintln!("trash restore: target already exists: {}", target.display());
         return ExitCode::from(1);
     }
 
     // Create parent dirs
     if let Some(parent) = target.parent() {
-        if !parent.exists() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
                 eprintln!("trash restore: cannot create {}: {}", parent.display(), e);
                 return ExitCode::from(1);
@@ -794,9 +947,18 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         }
     }
 
-    // Move from trash back
+    // H-3: move from trash back ATOMICALLY, refusing to overwrite. Closes the
+    // exists()->rename TOCTOU and any symlink-follow clobber of an existing
+    // file at the destination.
     let trash_path = trash_dir().join(&chosen.trash_filename);
-    if let Err(e) = libc_rename(&trash_path, &target) {
+    if let Err(e) = libc_rename_noreplace(&trash_path, &target) {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            eprintln!(
+                "trash restore: target appeared before restore, aborting: {}",
+                target.display()
+            );
+            return ExitCode::from(1);
+        }
         eprintln!(
             "trash restore: failed to move {} -> {}: {}",
             trash_path.display(),
@@ -896,6 +1058,66 @@ fn find_new_trash_entry(
     None
 }
 
+// ── Path resolution / validation ────────────────────────────────────
+
+/// Resolve a path for trashing WITHOUT resolving a symlink at the leaf.
+///
+/// H-4: `path.canonicalize()` resolves every symlink, so `trash mylink`
+/// (mylink -> /important/data) would canonicalize to /important/data and
+/// trash the *target*, diverging from `rm` semantics (which removes only the
+/// link) and recording the resolved target as `original_path` so a later
+/// restore writes to the wrong file. Instead, canonicalize only the parent
+/// directory and re-attach the original leaf name, so a symlink leaf is
+/// passed through untouched (`trash::delete` preserves symlink semantics).
+#[cfg(not(target_os = "windows"))]
+fn resolve_for_trash(path: &Path) -> io::Result<PathBuf> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let base = if parent.as_os_str().is_empty() {
+                std::env::current_dir()?
+            } else {
+                // Canonicalize the parent only. If the parent itself contains
+                // symlinks they are resolved (stable absolute location), but
+                // the leaf — the thing being trashed — is never followed.
+                parent.canonicalize()?
+            };
+            Ok(base.join(name))
+        }
+        // No file_name: "/", ".", "..", or a trailing-slash root. These are
+        // never valid trash targets; let canonicalize produce the error.
+        _ => path.canonicalize(),
+    }
+}
+
+/// Validate a restore destination decoded from a (potentially attacker-
+/// controlled) `.trashinfo` `Path=` field.
+///
+/// H-1: `read_trash_info` percent-decodes `Path=` with no validation, and
+/// `cmd_restore` renames the trashed bytes onto it. Combined with the
+/// no-overwrite atomic rename (`libc_rename_noreplace`), this rejects the
+/// shapes that make the primitive dangerous: a non-absolute path, any `..`
+/// component (directory traversal), or an embedded NUL. The atomic rename
+/// then guarantees an existing file at the target is never clobbered.
+#[cfg(not(target_os = "windows"))]
+fn validate_restore_target(target: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if target.as_os_str().is_empty() {
+        return Err("empty restore path".into());
+    }
+    if target.to_str().map(|s| s.contains('\0')).unwrap_or(true) {
+        return Err("restore path contains NUL or is non-UTF-8".into());
+    }
+    if !target.is_absolute() {
+        return Err("restore path is not absolute".into());
+    }
+    for comp in target.components() {
+        if comp == Component::ParentDir {
+            return Err("restore path contains '..'".into());
+        }
+    }
+    Ok(())
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
@@ -909,6 +1131,15 @@ fn main() -> ExitCode {
     if args[0] == "--version" || args[0] == "-V" {
         println!("trash {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
+    }
+
+    // M-3: refuse to run with an unsafe HOME before computing any trash path.
+    // A missing/relative HOME previously fell back to world-writable /tmp,
+    // which any local user could pre-plant with symlinks to weaponize H-1/H-2.
+    #[cfg(not(target_os = "windows"))]
+    if let Err(why) = validate_home() {
+        eprintln!("trash: {why}; refusing to run (set HOME to an absolute path)");
+        return ExitCode::from(1);
     }
 
     // ── Subcommand dispatch ──────────────────────────────────────
@@ -982,7 +1213,9 @@ fn main() -> ExitCode {
             continue;
         }
 
-        let canonical = match path.canonicalize() {
+        // H-4: resolve for trashing without following a symlink at the leaf,
+        // so `trash mylink` removes the link (rm semantics), not its target.
+        let canonical = match resolve_for_trash(path) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("trash: cannot resolve {}: {e}", path.display());
@@ -1110,4 +1343,165 @@ PLATFORMS:
 Designed for Claude Code: block `rm` in deny policies, allow `trash`.
 https://github.com/quantum-encoding/ai-trash"
     );
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+// Every filesystem test operates ONLY in a unique scratch dir under the
+// system temp dir. Nothing touches the repo, $HOME, or the real trash.
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    /// A unique scratch directory under the OS temp dir, guaranteed to be
+    /// outside the source tree and the real trash. Auto-removed on drop.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "ai-trash-test-{}-{}-{}",
+                tag,
+                std::process::id(),
+                nanos
+            ));
+            // Refuse to run a destructive test anywhere but a fresh temp dir.
+            assert!(dir.starts_with(std::env::temp_dir()));
+            let ds = dir.to_string_lossy();
+            assert!(!ds.contains("ai-trash/src"), "scratch must not be in the repo");
+            assert!(!ds.contains("/.Trash"), "scratch must not be the real trash");
+            fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // ── H-2: symlink traversal on remove ────────────────────────────
+    // Discriminates the real bug class: swapping `symlink_metadata` for
+    // `metadata`/`is_dir` (which follow the link) makes `libc_remove` recurse
+    // through `badlink` into `victim` and delete `precious`. Verified by
+    // mutation (temporarily reverting the guard fails this test).
+    #[test]
+    fn h2_remove_does_not_follow_symlink_to_outside_dir() {
+        let s = Scratch::new("h2");
+        let victim = s.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        let precious = victim.join("precious.txt");
+        fs::write(&precious, b"must survive").unwrap();
+
+        let trashlike = s.path().join("trash");
+        fs::create_dir_all(&trashlike).unwrap();
+        let badlink = trashlike.join("badlink");
+        std::os::unix::fs::symlink(&victim, &badlink).unwrap();
+
+        // Remove the symlink directly: only the link must go.
+        libc_remove(&badlink).unwrap();
+        assert!(fs::symlink_metadata(&badlink).is_err(), "symlink should be gone");
+        assert!(precious.exists(), "H-2: file behind the symlink must survive");
+
+        // Now remove the whole trash-like dir (recursion path) with a fresh
+        // symlink inside it: the walk must still not follow into victim.
+        let badlink2 = trashlike.join("badlink2");
+        std::os::unix::fs::symlink(&victim, &badlink2).unwrap();
+        libc_remove(&trashlike).unwrap();
+        assert!(trashlike.symlink_metadata().is_err(), "trash dir should be gone");
+        assert!(precious.exists(), "H-2: victim must survive recursive empty");
+        assert!(victim.exists());
+    }
+
+    // ── H-4: `trash <symlink>` must resolve to the link, not the target ──
+    #[test]
+    fn h4_resolve_keeps_symlink_leaf() {
+        let s = Scratch::new("h4");
+        let target = s.path().join("target.txt");
+        fs::write(&target, b"data").unwrap();
+        let link = s.path().join("mylink");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let resolved = resolve_for_trash(&link).unwrap();
+        assert_eq!(
+            resolved.file_name().unwrap(),
+            std::ffi::OsStr::new("mylink"),
+            "H-4: leaf name must stay the link, not resolve to target.txt"
+        );
+        // The resolved path must not be the canonicalized target file.
+        assert_ne!(resolved, target.canonicalize().unwrap());
+        // A regular (non-symlink) leaf still resolves fine.
+        let plain = resolve_for_trash(&target).unwrap();
+        assert_eq!(plain.file_name().unwrap(), std::ffi::OsStr::new("target.txt"));
+    }
+
+    // ── H-1: restore target validation ──────────────────────────────
+    #[test]
+    fn h1_validate_restore_target() {
+        assert!(validate_restore_target(Path::new("/Users/me/ok/file")).is_ok());
+        assert!(validate_restore_target(Path::new("relative/path")).is_err());
+        assert!(validate_restore_target(Path::new("/Users/me/../../etc/x")).is_err());
+        assert!(validate_restore_target(Path::new("/a/b/../c")).is_err());
+        assert!(validate_restore_target(Path::new("")).is_err());
+        // A clean absolute path with no traversal is accepted.
+        assert!(validate_restore_target(Path::new("/tmp/restore/here.txt")).is_ok());
+    }
+
+    // ── H-3: atomic no-overwrite rename ─────────────────────────────
+    #[test]
+    fn h3_rename_noreplace_refuses_overwrite() {
+        let s = Scratch::new("h3");
+        let from = s.path().join("from");
+        fs::write(&from, b"new").unwrap();
+        let to = s.path().join("to");
+        fs::write(&to, b"ORIGINAL").unwrap();
+
+        let err = libc_rename_noreplace(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // The existing destination is untouched, and `from` still exists.
+        assert_eq!(fs::read(&to).unwrap(), b"ORIGINAL");
+        assert!(from.exists());
+
+        // Into a fresh name it succeeds.
+        let fresh = s.path().join("fresh");
+        libc_rename_noreplace(&from, &fresh).unwrap();
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+        assert!(!from.exists());
+    }
+
+    // ── M-2: parse_iso_datetime must not panic on multi-byte input ──
+    #[test]
+    fn m2_parse_iso_datetime_no_panic_on_multibyte() {
+        // Multi-byte chars where byte-len >= 19 but char boundaries differ.
+        assert!(parse_iso_datetime("żẐẑẓ-Ẕ0-01T00:00:00").is_none());
+        assert!(parse_iso_datetime("日本語です-aa-bbTcc:dd:ee").is_none());
+        // Valid one parses.
+        assert!(parse_iso_datetime("2026-04-28T10:30:00").is_some());
+        // Non-digit where digits expected -> None, not panic.
+        assert!(parse_iso_datetime("20xx-04-28T10:30:00").is_none());
+    }
+
+    // ── M-1: inline UTC formatter round-trips with the parser ───────
+    #[test]
+    fn m1_format_iso_utc_roundtrip() {
+        // Expected values are from the system `date -u` (independent oracle),
+        // not self-derived: `date -u -r <epoch> +%Y-%m-%dT%H:%M:%S`.
+        assert_eq!(format_iso_utc(0), "1970-01-01T00:00:00");
+        assert_eq!(format_iso_utc(1_000_000_000), "2001-09-09T01:46:40");
+        assert_eq!(format_iso_utc(1_500_000_123), "2017-07-14T02:42:03");
+        assert_eq!(format_iso_utc(1_777_683_198), "2026-05-02T00:53:18");
+        for &t in &[0u64, 1_000_000_000, 1_777_683_198, 1_500_000_123] {
+            let iso = format_iso_utc(t);
+            let parsed = parse_iso_datetime(&iso).unwrap();
+            let back = parsed.duration_since(UNIX_EPOCH).unwrap().as_secs();
+            assert_eq!(back, t, "round trip failed for {t}");
+        }
+    }
 }

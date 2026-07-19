@@ -6,6 +6,33 @@ Scanner: `qai security` (rate-limited on CVE feed; AST pass clean) + manual revi
 
 ---
 
+## Remediation status — 2026-07-19
+
+All four High and all three Medium findings are **fixed** in `src/main.rs`, with a
+`#[cfg(test)]` suite (6 tests, scratch-dir only) covering each. `cargo build`,
+`cargo build --release`, and `cargo test` are green. The H-2 test was
+mutation-verified: reverting the `symlink_metadata` guard to `metadata` makes it
+red at the "victim survives" assertion, then reverted to green.
+
+| # | Fix | Where |
+|---|---|---|
+| H-1 | `validate_restore_target` rejects non-absolute / `..` / NUL on the .trashinfo-derived path; overwrite blocked by the atomic rename below | `cmd_restore`, `validate_restore_target` |
+| H-2 | `libc_remove` classifies each entry via `symlink_metadata` (not `is_dir`) and never recurses through a symlink; depth-capped (L-3) | `libc_remove_depth` |
+| H-3 | atomic no-overwrite rename (`renameatx_np(RENAME_EXCL)` / `renameat2(RENAME_NOREPLACE)`) replaces `exists()`+`rename` | `libc_rename_noreplace` |
+| H-4 | `resolve_for_trash` canonicalizes only the parent, so `trash <symlink>` trashes the link, not the target | `resolve_for_trash`, `main` |
+| M-1 | inline UTC formatter replaces `Command::new("date")` — no subprocess, no PATH dependency; also fixes the write-local/read-UTC skew | `now_iso`, `format_iso_utc` |
+| M-2 | byte-safe, digit-checked field extraction — no panic on multi-byte `.trashinfo` dates | `parse_iso_datetime` |
+| M-3 | `validate_home` gates `main`; the `/tmp` fallback is removed (single `home_base` read site) | `validate_home`, `home_base`, `main` |
+
+**Residuals (documented, not yet closed):**
+- **H-1 (create branch):** the atomic rename prevents *overwriting* an existing file, and traversal is rejected, but restoring to a *non-existent* attacker-named absolute path (no `..`) can still create a new file there. Lower severity (no clobber); a full fix would confine restore under `$HOME` or the original volume, which would break legitimate cross-volume restores without `--to`.
+- **H-2 / L-2:** a same-UID attacker who wins a tight dir→symlink swap race between `symlink_metadata` and `read_dir` could still divert one level. The `*at`-family walk (`openat O_NOFOLLOW` + `unlinkat`) is the defense-in-depth fix; deferred as beyond the documented threat model.
+- **L-1** (snapshot-diff race) unchanged; **M-1 display**: timestamps are now shown in UTC, not local (a deliberate consistency fix for `--older`).
+
+Installed binary note: `~/.local/bin/trash` (mtime Mar 22) predates even the audit; it must be rebuilt + reinstalled to carry these fixes.
+
+---
+
 ## H-1 — Arbitrary file overwrite via crafted `.trashinfo` on `restore`  [CWE-22 / CWE-732]
 
 **File:** `src/main.rs:113-146`, `:150-169`, `:769-811`
