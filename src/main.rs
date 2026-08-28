@@ -86,6 +86,131 @@ fn libc_rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+// ── PATH_MAX guard ──────────────────────────────────────────────────
+//
+// A path can only be opened, stat'd or unlinked if it fits in the platform's
+// PATH_MAX. Directory trees can be built well past it, because `mkdir` relative
+// to the current directory never resolves a full path — build systems, package
+// managers and recursive-copy bugs all do it by accident.
+//
+// Trashing such a tree ALWAYS succeeds: a move is a single `rename()` on the
+// top directory and never touches a descendant. Deleting it afterwards must
+// recurse, and every absolute path that walk builds fails with ENAMETOOLONG.
+// The trash is the worst possible place for that to land — one unreachable
+// directory stops the whole trash being emptied, by Finder or by this tool, and
+// nothing in the resulting error names the item responsible.
+//
+// So the check happens HERE, at the moment the tree can still be dealt with
+// where it stands, rather than hours later as "the trash is broken".
+
+#[cfg(target_os = "macos")]
+const ENAMETOOLONG: i32 = 63;
+#[cfg(not(target_os = "macos"))]
+const ENAMETOOLONG: i32 = 36;
+
+/// The platform limit on a resolved path. 1024 on macOS and Linux alike.
+const PATH_MAX_BYTES: usize = 1024;
+
+/// Trash names collide, and both Finder and this tool disambiguate by appending
+/// a timestamp (`build 23.38.39`). Reserve room for it, so a tree that only
+/// just fits is not waved through into a destination where it does not.
+const TRASH_NAME_MARGIN: usize = 24;
+
+/// How many directory entries the scan will look at before giving up.
+///
+/// The walk is depth-first, so it DIVES: a pathological chain is found after
+/// roughly its own depth in readdir calls, which is why a budget can be small
+/// and still catch what matters. What the budget actually bounds is the honest
+/// case — a huge, flat tree with nothing wrong — where a full walk would cost
+/// more than the guard is worth.
+const SCAN_BUDGET: usize = 100_000;
+
+/// Why a tree cannot be trashed safely. The two cases need different words:
+/// one is a prediction about the destination, the other is a fact about the
+/// tree as it already stands.
+enum Why {
+    /// It fits where it is, but would not once moved under the trash path.
+    WouldExceed,
+    /// It does not fit even now — the scan could not read that far down,
+    /// with ENAMETOOLONG, which is precisely the failure Finder hits later.
+    AlreadyUnreachable,
+}
+
+enum LongPath {
+    /// Every descendant still fits once the tree is moved.
+    Fits,
+    /// A descendant would not be addressable at the destination.
+    TooLong { sample: PathBuf, len: usize, why: Why },
+    /// The budget ran out. Nothing was found, and nothing is proven — reported
+    /// only under `-v`, never as a refusal, because a guard that blocks on its
+    /// own indecision is worse than the problem it guards against.
+    Unscanned,
+}
+
+/// Walk `src` looking for the first descendant whose path would exceed
+/// PATH_MAX once the tree sits under `dest_root_len` bytes of trash path.
+///
+/// Symlinks are never followed — `DirEntry::file_type` reports the link itself,
+/// so a symlink loop cannot turn this into an infinite descent.
+fn scan_for_long_paths(src: &Path, dest_root_len: usize) -> LongPath {
+    let mut stack = vec![(src.to_path_buf(), dest_root_len)];
+    let mut budget = SCAN_BUDGET;
+
+    while let Some((dir, dest_len)) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.raw_os_error() == Some(ENAMETOOLONG) => {
+                // The scan just hit the wall it exists to warn about: this
+                // directory cannot be addressed from where the tree already
+                // sits. Skipping it — the obvious reading of "unreadable" —
+                // would walk straight past the only thing worth finding, which
+                // is exactly how a guard against this bug reproduces it.
+                return LongPath::TooLong {
+                    sample: dir,
+                    len: dest_len,
+                    why: Why::AlreadyUnreachable,
+                };
+            }
+            // Anything else is a permission or race problem, not evidence
+            // about path length; the delete itself will report it.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return LongPath::Unscanned;
+            }
+            budget -= 1;
+
+            let name_len = entry.file_name().as_encoded_bytes().len();
+            let child_len = dest_len + 1 + name_len;
+            if child_len + TRASH_NAME_MARGIN > PATH_MAX_BYTES {
+                return LongPath::TooLong {
+                    sample: entry.path(),
+                    len: child_len,
+                    why: Why::WouldExceed,
+                };
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push((entry.path(), child_len));
+            }
+        }
+    }
+    LongPath::Fits
+}
+
+/// Show a path that is by definition too long to print. Keeping both ends makes
+/// it recognisable — the head says which tree, the tail shows the repetition
+/// that is almost always the cause.
+fn elide_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if s.chars().count() <= 120 {
+        return s.into_owned();
+    }
+    let head: String = s.chars().take(80).collect();
+    let tail: String = s.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{head}…{tail}")
+}
+
 /// Maximum directory recursion depth for `libc_remove` (L-3: bound the walk
 /// so a pathologically deep trashed tree can't blow the thread stack).
 const MAX_REMOVE_DEPTH: u32 = 256;
@@ -1159,6 +1284,7 @@ fn main() -> ExitCode {
     let mut dry_run = false;
     let mut verbose = false;
     let mut force = false;
+    let mut allow_long_paths = false;
     let mut paths: Vec<PathBuf> = Vec::new();
 
     let mut i = 0;
@@ -1167,6 +1293,7 @@ fn main() -> ExitCode {
             "-n" | "--dry-run" => dry_run = true,
             "-v" | "--verbose" => verbose = true,
             "-f" | "--force" => force = true,
+            "--allow-long-paths" => allow_long_paths = true,
             "-r" | "-rf" | "-R" => {} // accept and ignore — directories are always handled
             "--" => {
                 // everything after -- is a path
@@ -1224,8 +1351,52 @@ fn main() -> ExitCode {
             }
         };
 
+        // Only directories can hide a path longer than the one handed in.
+        // symlink_metadata, not is_dir: a symlink to a directory is trashed as
+        // the link, so there is nothing below it to walk.
+        let is_dir = canonical.symlink_metadata().is_ok_and(|m| m.is_dir());
+        if !allow_long_paths && is_dir {
+            let dest_root = trash_dir().join(canonical.file_name().unwrap_or_default());
+            match scan_for_long_paths(&canonical, dest_root.as_os_str().as_encoded_bytes().len()) {
+                LongPath::TooLong { sample, len, why } => {
+                    let diagnosis = match why {
+                        Why::WouldExceed => format!(
+                            "it holds a path that would be {len} bytes once trashed, past this \
+                             system's {PATH_MAX_BYTES}-byte limit"
+                        ),
+                        Why::AlreadyUnreachable => String::from(
+                            "it is deeper than a path can express — this directory could not be \
+                             opened even where it sits (ENAMETOOLONG)",
+                        ),
+                    };
+                    eprintln!(
+                        "trash: refusing to trash {}\n  {diagnosis}:\n    {}\n  \
+                         The move itself would succeed — it is one rename() on the top directory \
+                         — and afterwards nothing could delete it, including emptying the trash \
+                         at all.\n  \
+                         Clear it where it stands with `find {} -delete` (that walks by directory \
+                         handle, so no path limit applies), or pass --allow-long-paths to trash \
+                         it anyway.",
+                        canonical.display(),
+                        elide_path(&sample),
+                        canonical.display(),
+                    );
+                    errors += 1;
+                    continue;
+                }
+                LongPath::Unscanned if verbose => {
+                    eprintln!(
+                        "trash: {} is too large to check for over-long paths ({SCAN_BUDGET} \
+                         entries scanned); trashing it unchecked",
+                        canonical.display()
+                    );
+                }
+                _ => {}
+            }
+        }
+
         if dry_run {
-            let kind = if canonical.is_dir() { "dir " } else { "file" };
+            let kind = if is_dir { "dir " } else { "file" };
             println!("would trash {kind}: {}", canonical.display());
             continue;
         }
@@ -1299,6 +1470,11 @@ OPTIONS:
     -n, --dry-run   Show what would be trashed without doing it
     -v, --verbose   Print each path as it is trashed
     -f, --force     Ignore missing files (no error)
+        --allow-long-paths
+                    Trash a tree even if it holds paths that will exceed the
+                    system PATH_MAX at the destination. Refused by default:
+                    such a tree cannot be deleted afterwards and blocks the
+                    whole trash from being emptied.
     -r              Accepted for rm compatibility (directories always work)
     -h, --help      Show this help
     -V, --version   Show version
@@ -1503,5 +1679,107 @@ mod tests {
             let back = parsed.duration_since(UNIX_EPOCH).unwrap().as_secs();
             assert_eq!(back, t, "round trip failed for {t}");
         }
+    }
+
+    // ── PATH_MAX guard ──────────────────────────────────────────────
+    // Deep fixtures cannot be removed by any path-based call, Scratch's own
+    // Drop included, so these wipe with a directory-handle walk first.
+
+    fn wipe(d: &Path) {
+        let _ = std::process::Command::new("/usr/bin/find")
+            .arg(d)
+            .arg("-delete")
+            .output();
+    }
+
+    /// Build `depth` nested directories.
+    ///
+    /// Done in a SUBPROCESS on purpose. Past PATH_MAX the only way down is to
+    /// descend and create relatively — and the process working directory is
+    /// global, so doing that in-process would race every other test in this
+    /// module. It is also, incidentally, exactly how a shell loop produces one
+    /// of these trees for real.
+    fn nest(root: &Path, depth: usize) {
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "cd {} && for i in $(seq 1 {depth}); do mkdir -p d && cd d; done",
+                root.display()
+            ))
+            .output()
+            .expect("build the deep fixture");
+        assert!(out.status.success(), "nest failed: {out:?}");
+    }
+
+    #[test]
+    fn an_ordinary_tree_is_not_flagged() {
+        let s = Scratch::new("pm-ordinary");
+        fs::create_dir_all(s.path().join("a/b/c")).unwrap();
+        fs::write(s.path().join("a/b/c/f.txt"), b"hi").unwrap();
+        assert!(matches!(scan_for_long_paths(s.path(), 30), LongPath::Fits));
+    }
+
+    #[test]
+    fn a_tree_that_only_exceeds_once_moved_is_caught_before_the_move() {
+        // The tree is perfectly addressable where it stands. What makes it a
+        // problem is the DESTINATION prefix, so the guard has to do the
+        // arithmetic rather than settle for trying to walk it.
+        let s = Scratch::new("pm-would-exceed");
+        fs::create_dir_all(s.path().join("a/b/c/d/e")).unwrap();
+        assert!(
+            matches!(scan_for_long_paths(s.path(), 30), LongPath::Fits),
+            "fits under a short trash path"
+        );
+        let near_limit = PATH_MAX_BYTES - TRASH_NAME_MARGIN - 4;
+        match scan_for_long_paths(s.path(), near_limit) {
+            LongPath::TooLong { why: Why::WouldExceed, .. } => {}
+            _ => panic!("a tree that would not fit at the destination must be refused"),
+        }
+    }
+
+    #[test]
+    fn the_margin_reserves_room_for_the_collision_suffix() {
+        // Finder and this tool both disambiguate a name collision by appending
+        // a timestamp. A tree that fits EXACTLY stops fitting once renamed, so
+        // the guard must refuse before the arithmetic reaches zero bytes spare.
+        let s = Scratch::new("pm-margin");
+        fs::create_dir(s.path().join("xx")).unwrap();
+        // Sized so the child lands just INSIDE PATH_MAX on its own and only
+        // breaches once the suffix is allowed for. Without the margin this
+        // case passes, which is the whole point of asserting it.
+        let snug = PATH_MAX_BYTES - TRASH_NAME_MARGIN - 2;
+        let child_len = snug + 1 + 2; // "/xx"
+        assert!(child_len <= PATH_MAX_BYTES, "the child fits unaided");
+        assert!(
+            matches!(scan_for_long_paths(s.path(), snug), LongPath::TooLong { .. }),
+            "the collision suffix has to be accounted for"
+        );
+    }
+
+    #[test]
+    fn a_tree_deeper_than_a_path_can_express_is_caught_rather_than_walked_past() {
+        // The regression that matters. A first cut treated the scan's own
+        // ENAMETOOLONG as "unreadable, skip it" and walked straight past the
+        // only thing worth finding — reproducing, inside the guard, the exact
+        // failure the guard exists to prevent.
+        let s = Scratch::new("pm-unreachable");
+        nest(s.path(), 510);
+        let verdict = scan_for_long_paths(s.path(), 30);
+        wipe(s.path());
+        match verdict {
+            LongPath::TooLong { why: Why::AlreadyUnreachable, .. } => {}
+            _ => panic!("a tree that cannot be opened where it sits must be refused"),
+        }
+    }
+
+    #[test]
+    fn an_over_long_path_is_elided_at_both_ends() {
+        // The head names the tree, the tail shows the repetition that is
+        // almost always the cause. A path this long is unreadable otherwise.
+        let p = PathBuf::from(format!("/tmp/deepx/{}", "d/".repeat(400)));
+        let e = elide_path(&p);
+        assert!(e.chars().count() < 130, "elided to {} chars", e.chars().count());
+        assert!(e.starts_with("/tmp/deepx/"), "keeps the head: {e}");
+        assert!(e.contains('…'), "marks the elision: {e}");
     }
 }
