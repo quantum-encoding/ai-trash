@@ -1,7 +1,8 @@
 //! trash — move files and directories to the system trash.
 //!
 //! A safe alternative to `rm` that uses the OS-native trash:
-//!   - macOS: Finder Trash (recoverable via Put Back)
+//!   - macOS: Finder Trash, via the `trash` crate's Finder method (Put Back
+//!     works); this tool also records a `.trashinfo` for `list` / `restore`
 //!   - Windows: Recycle Bin
 //!   - Linux: freedesktop.org trash specification
 //!
@@ -15,8 +16,6 @@
 //! Designed for use with Claude Code and other AI agents where `rm -rf`
 //! is blocked by deny policies but safe deletion should be allowed.
 
-#![allow(dead_code, unused_imports)]
-
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
@@ -24,22 +23,33 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-// ── libc wrappers for macOS TCC bypass ─────────────────────────────
-// macOS TCC blocks std::fs operations on ~/.Trash/ but libc calls work
-// when our process has the right entitlements (e.g. linked Foundation).
+// ── libc declarations ───────────────────────────────────────────────
+// Declared by hand so the crate carries no `libc` dependency. `unlink` and
+// `rmdir` let `libc_remove` act on exactly one entry per call, never
+// following a symlink (see H-2 in findings.md).
+
+use std::ffi::c_char;
 
 unsafe extern "C" {
-    fn rename(old: *const i8, new: *const i8) -> i32;
-    fn unlink(path: *const i8) -> i32;
-    fn rmdir(path: *const i8) -> i32;
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+    fn rename(old: *const c_char, new: *const c_char) -> i32;
+    fn unlink(path: *const c_char) -> i32;
+    fn rmdir(path: *const c_char) -> i32;
 }
 
 // Atomic rename that refuses to overwrite an existing destination.
 // macOS: renameatx_np(RENAME_EXCL); Linux: renameat2(RENAME_NOREPLACE).
-// This closes H-3 (exists()->rename TOCTOU) and the overwrite half of H-1.
+// Restore relies on it: there is no exists()->rename window to race (H-3),
+// and an existing file at the target is never overwritten (H-1).
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn renameatx_np(fromfd: i32, from: *const i8, tofd: i32, to: *const i8, flags: u32) -> i32;
+    fn renameatx_np(
+        fromfd: i32,
+        from: *const c_char,
+        tofd: i32,
+        to: *const c_char,
+        flags: u32,
+    ) -> i32;
 }
 #[cfg(target_os = "macos")]
 const AT_FDCWD: i32 = -2;
@@ -48,7 +58,13 @@ const RENAME_EXCL: u32 = 0x0000_0004;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
-    fn renameat2(olddirfd: i32, oldpath: *const i8, newdirfd: i32, newpath: *const i8, flags: u32) -> i32;
+    fn renameat2(
+        olddirfd: i32,
+        oldpath: *const c_char,
+        newdirfd: i32,
+        newpath: *const c_char,
+        flags: u32,
+    ) -> i32;
 }
 #[cfg(target_os = "linux")]
 const AT_FDCWD: i32 = -100;
@@ -64,20 +80,37 @@ fn libc_rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let from_c = path_to_cstring(from)?;
     let to_c = path_to_cstring(to)?;
     #[cfg(target_os = "macos")]
-    let rc = unsafe { renameatx_np(AT_FDCWD, from_c.as_ptr(), AT_FDCWD, to_c.as_ptr(), RENAME_EXCL) };
+    let rc = unsafe {
+        renameatx_np(
+            AT_FDCWD,
+            from_c.as_ptr(),
+            AT_FDCWD,
+            to_c.as_ptr(),
+            RENAME_EXCL,
+        )
+    };
     #[cfg(target_os = "linux")]
-    let rc = unsafe { renameat2(AT_FDCWD, from_c.as_ptr(), AT_FDCWD, to_c.as_ptr(), RENAME_NOREPLACE) };
+    let rc = unsafe {
+        renameat2(
+            AT_FDCWD,
+            from_c.as_ptr(),
+            AT_FDCWD,
+            to_c.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let rc = {
-        // Fallback for other Unixes without renameat2/renameatx_np: best-effort
-        // link+unlink is not atomic across filesystems, so fall back to a
-        // plain rename only after a non-atomic existence check.
+        // Other Unixes have no atomic no-replace rename here, so this is a
+        // check-then-rename: an entry created at `to` between the two calls
+        // is overwritten.
         if to.symlink_metadata().is_ok() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination exists",
+            ));
         }
-        let from_c2 = path_to_cstring(from)?;
-        let to_c2 = path_to_cstring(to)?;
-        unsafe { rename(from_c2.as_ptr(), to_c2.as_ptr()) }
+        unsafe { rename(from_c.as_ptr(), to_c.as_ptr()) }
     };
     if rc == 0 {
         Ok(())
@@ -108,12 +141,14 @@ const ENAMETOOLONG: i32 = 63;
 #[cfg(not(target_os = "macos"))]
 const ENAMETOOLONG: i32 = 36;
 
-/// The platform limit on a resolved path. 1024 on macOS and Linux alike.
+/// The limit on a resolved path: macOS's PATH_MAX. Linux allows 4096, so there
+/// this refuses some trees that would still fit — the conservative direction,
+/// and `--allow-long-paths` overrides it.
 const PATH_MAX_BYTES: usize = 1024;
 
-/// Trash names collide, and both Finder and this tool disambiguate by appending
-/// a timestamp (`build 23.38.39`). Reserve room for it, so a tree that only
-/// just fits is not waved through into a destination where it does not.
+/// Trash names collide, and Finder disambiguates by appending a timestamp
+/// (`build 23.38.39`). Reserve room for it, so a tree that only just fits is
+/// not waved through into a destination where it does not.
 const TRASH_NAME_MARGIN: usize = 24;
 
 /// How many directory entries the scan will look at before giving up.
@@ -140,7 +175,11 @@ enum LongPath {
     /// Every descendant still fits once the tree is moved.
     Fits,
     /// A descendant would not be addressable at the destination.
-    TooLong { sample: PathBuf, len: usize, why: Why },
+    TooLong {
+        sample: PathBuf,
+        len: usize,
+        why: Why,
+    },
     /// The budget ran out. Nothing was found, and nothing is proven — reported
     /// only under `-v`, never as a refusal, because a guard that blocks on its
     /// own indecision is worse than the problem it guards against.
@@ -207,12 +246,19 @@ fn elide_path(p: &Path) -> String {
         return s.into_owned();
     }
     let head: String = s.chars().take(80).collect();
-    let tail: String = s.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(30)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}…{tail}")
 }
 
-/// Maximum directory recursion depth for `libc_remove` (L-3: bound the walk
-/// so a pathologically deep trashed tree can't blow the thread stack).
+/// Maximum directory recursion depth for `libc_remove`. Bounds the walk so a
+/// pathologically deep trashed tree cannot blow the thread stack (L-3).
 const MAX_REMOVE_DEPTH: u32 = 256;
 
 fn libc_remove(path: &Path) -> io::Result<()> {
@@ -248,8 +294,9 @@ fn libc_remove_depth(path: &Path, depth: u32) -> io::Result<()> {
     if unsafe { rmdir(path_c.as_ptr()) } == 0 {
         return Ok(());
     }
-    // read_dir on a verified-real directory does not traverse a symlink at
-    // `path`. Each child is re-checked via symlink_metadata on the recursion.
+    // Each child is re-checked via symlink_metadata on the recursion. A
+    // same-UID swap of `path` for a symlink between the check above and this
+    // read_dir is a documented residual (findings.md, H-2 / L-2).
     for entry in fs::read_dir(path).into_iter().flatten().flatten() {
         libc_remove_depth(&entry.path(), depth + 1).ok();
     }
@@ -261,17 +308,20 @@ fn libc_remove_depth(path: &Path, depth: u32) -> io::Result<()> {
 }
 
 fn path_to_cstring(path: &Path) -> io::Result<CString> {
-    CString::new(path.to_str().ok_or_else(|| io::Error::other("invalid path"))?)
-        .map_err(|_| io::Error::other("path contains null"))
+    CString::new(
+        path.to_str()
+            .ok_or_else(|| io::Error::other("invalid path"))?,
+    )
+    .map_err(|_| io::Error::other("path contains null"))
 }
 
 // ── Platform helpers ────────────────────────────────────────────────
 
-/// Validate `$HOME` once and return it. Errors if unset or not absolute.
-/// Called by `main` up front so the whole process refuses to run with an
-/// unsafe HOME rather than silently falling back to world-writable `/tmp`
-/// (M-3), where any local user could pre-plant symlinks to weaponize
-/// H-1/H-2 against the next invocation.
+/// Validate `$HOME` and return it. Errors if unset, empty or not absolute.
+/// Every trash path is built under HOME, and there is deliberately no
+/// fallback: a shared directory such as `/tmp` would let any local user
+/// pre-plant symlinks there to weaponize H-1/H-2 (M-3). `main` calls this
+/// before doing anything else.
 #[cfg(not(target_os = "windows"))]
 fn validate_home() -> Result<PathBuf, String> {
     match std::env::var("HOME") {
@@ -282,9 +332,9 @@ fn validate_home() -> Result<PathBuf, String> {
     }
 }
 
-/// The user's home directory. `main` validates HOME before any trash path is
-/// computed, so this read cannot fall through to `/tmp`; if the invariant is
-/// ever violated it panics loudly rather than touching a shared directory.
+/// The user's home directory. `main` has already validated HOME, so this
+/// cannot fail; if that invariant is ever broken it panics rather than
+/// touching any other directory.
 #[cfg(not(target_os = "windows"))]
 fn home_base() -> PathBuf {
     validate_home().expect("HOME is validated at startup (see main)")
@@ -330,7 +380,7 @@ fn read_trash_info(path: &Path) -> Option<TrashEntry> {
 
     for line in content.lines() {
         if let Some(val) = line.strip_prefix("Path=") {
-            // Linux trashinfo uses percent-encoding
+            // Percent-encoded, per the freedesktop trash spec.
             original_path = percent_decode(val);
         } else if let Some(val) = line.strip_prefix("DeletionDate=") {
             deletion_date = val.to_string();
@@ -365,15 +415,15 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(val) = u8::from_str_radix(
-                &String::from_utf8_lossy(&bytes[i + 1..i + 3]),
-                16,
-            ) {
-                out.push(val);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).and_then(|&b| hex_val(b)),
+                bytes.get(i + 2).and_then(|&b| hex_val(b)),
+            )
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -381,16 +431,35 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+#[cfg(not(target_os = "windows"))]
+fn hex_val(b: u8) -> Option<u8> {
+    (b as char).to_digit(16).map(|d| d as u8)
+}
+
+/// Percent-encode a path for a `.trashinfo` `Path=` line, per the freedesktop
+/// trash spec: every byte outside the unreserved set and `/` is escaped. This
+/// is what keeps a newline in a filename from injecting a second `Path=` line.
+#[cfg(any(target_os = "macos", test))]
+fn percent_encode(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for &b in raw {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Parse "2026-03-31T14:30:22" to SystemTime (UTC, best-effort).
 #[cfg(not(target_os = "windows"))]
 fn parse_iso_datetime(s: &str) -> Option<SystemTime> {
     // Format: YYYY-MM-DDTHH:MM:SS
     let s = s.trim();
-    // M-2: operate on bytes, not char slices. `s[0..4]` panics if a crafted
-    // DeletionDate places a multi-byte UTF-8 boundary inside the range (the
-    // `s.len() < 19` guard only checks byte length), which would abort every
-    // `trash list` run because one poisoned .trashinfo exists. Fixed-offset
-    // fields are ASCII digits by spec; extract them safely.
+    // Fields are read from bytes, not `&str` slices: `s[0..4]` panics when a
+    // crafted DeletionDate puts a multi-byte char across the offset, and one
+    // poisoned .trashinfo would then abort every `trash list` (M-2).
     let b = s.as_bytes();
     // Reads an unsigned integer from ASCII digits in b[start..end], or None.
     fn field(b: &[u8], start: usize, end: usize) -> Option<u64> {
@@ -408,17 +477,30 @@ fn parse_iso_datetime(s: &str) -> Option<SystemTime> {
     let min = field(b, 14, 16)?;
     let sec = field(b, 17, 19)?;
 
-    // Approximate: days from epoch to date
+    // Days from the epoch to the date. Exact for valid dates; out-of-range
+    // months and days are clamped rather than rejected.
     let mut days: u64 = 0;
     for y in 1970..year {
         days += if is_leap(y) { 366 } else { 365 };
     }
-    let month_days = [31, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 0..(month.saturating_sub(1) as usize) {
-        if m < 12 {
-            days += month_days[m];
-        }
-    }
+    let month_days = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    days += month_days
+        .iter()
+        .take(month.saturating_sub(1) as usize)
+        .sum::<u64>();
     days += day.saturating_sub(1);
     let secs = days * 86400 + hour * 3600 + min * 60 + sec;
     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
@@ -426,7 +508,7 @@ fn parse_iso_datetime(s: &str) -> Option<SystemTime> {
 
 #[cfg(not(target_os = "windows"))]
 fn is_leap(y: u64) -> bool {
-    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+    y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
 }
 
 // ── .trashinfo writing (macOS only — Linux handled by trash crate) ──
@@ -439,7 +521,7 @@ fn write_trash_info(trash_filename: &str, original_path: &Path) -> io::Result<()
     let now = now_iso();
     let content = format!(
         "[Trash Info]\nPath={}\nDeletionDate={}\n",
-        original_path.display(),
+        percent_encode(original_path.as_os_str().as_encoded_bytes()),
         now,
     );
 
@@ -449,15 +531,11 @@ fn write_trash_info(trash_filename: &str, original_path: &Path) -> io::Result<()
 
 /// Current UTC time as an ISO-8601 string `YYYY-MM-DDTHH:MM:SS`.
 ///
-/// M-1: the previous implementation shelled out to `Command::new("date")`
-/// with a bare program name, so a PATH containing an attacker-writable
-/// directory before `/bin` would run a hijacked `date` (whose output lands
-/// in the .trashinfo DeletionDate) with the user's privileges on every
-/// trash. This computes the timestamp inline — no subprocess, no PATH
-/// dependency. It also emits UTC, which is what `parse_iso_datetime` already
-/// assumes, fixing the prior write-local / read-as-UTC inconsistency that
-/// skewed `--older` age filtering by the local UTC offset.
-#[cfg(not(target_os = "windows"))]
+/// Computed inline rather than by running `date`: a PATH-resolved subprocess
+/// can be hijacked by any attacker-writable directory early in PATH (M-1).
+/// UTC matches what `parse_iso_datetime` assumes, so `--older` age filtering
+/// is not skewed by the local UTC offset.
+#[cfg(target_os = "macos")]
 fn now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -467,8 +545,8 @@ fn now_iso() -> String {
 }
 
 /// Format seconds-since-epoch as `YYYY-MM-DDTHH:MM:SS` in UTC.
-/// Inverse of `parse_iso_datetime`; shared so the round trip is exact.
-#[cfg(not(target_os = "windows"))]
+/// Inverse of `parse_iso_datetime`; the round trip is exact.
+#[cfg(any(target_os = "macos", test))]
 fn format_iso_utc(secs: u64) -> String {
     let mut days = secs / 86400;
     let rem = secs % 86400;
@@ -483,7 +561,20 @@ fn format_iso_utc(secs: u64) -> String {
         days -= year_days;
         year += 1;
     }
-    let month_days = [31, if is_leap(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        if is_leap(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 1usize;
     for (i, &md) in month_days.iter().enumerate() {
         if days < md {
@@ -571,10 +662,10 @@ fn collect_entries() -> Vec<TrashEntry> {
     if let Ok(dir) = fs::read_dir(&info) {
         for entry in dir.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("trashinfo") {
-                if let Some(te) = read_trash_info(&path) {
-                    entries.push(te);
-                }
+            if path.extension().and_then(|e| e.to_str()) == Some("trashinfo")
+                && let Some(te) = read_trash_info(&path)
+            {
+                entries.push(te);
             }
         }
     }
@@ -682,16 +773,14 @@ fn cmd_list(args: &[String]) -> ExitCode {
     let filtered: Vec<&TrashEntry> = entries
         .iter()
         .filter(|e| {
-            if let Some(max_age) = older_than {
-                if let Some(dt) = e.deletion_time {
-                    if let Ok(age) = now.duration_since(dt) {
-                        if age < max_age {
-                            return false;
-                        }
-                    }
-                } else {
-                    // No date info — can't filter by age, include it
-                }
+            // Items with no date (or a date in the future) cannot be aged,
+            // so the filter keeps them.
+            if let Some(max_age) = older_than
+                && let Some(dt) = e.deletion_time
+                && let Ok(age) = now.duration_since(dt)
+                && age < max_age
+            {
+                return false;
             }
             if project_filter && !e.original_path.starts_with(&cwd_str) {
                 return false;
@@ -725,14 +814,14 @@ fn cmd_list(args: &[String]) -> ExitCode {
             println!("Trash is empty.");
             return ExitCode::SUCCESS;
         }
-        // Tabular: DATE  ORIGINAL_PATH
+        // Tabular: DATE  ORIGINAL_PATH, the date padded to ISO-8601 width.
         for e in &filtered {
             let date = if e.deletion_date.is_empty() {
-                "unknown     ".to_string()
+                "unknown"
             } else {
-                // Pad or truncate to 19 chars
-                format!("{:<19}", &e.deletion_date)
+                e.deletion_date.as_str()
             };
+            let date = format!("{date:<19}");
             let path = if e.original_path.is_empty() {
                 format!("{} (trashed externally)", e.trash_filename)
             } else {
@@ -840,7 +929,9 @@ fn cmd_empty(args: &[String]) -> ExitCode {
         let entries = collect_entries();
         for entry in &entries {
             let should_delete = if let Some(dt) = entry.deletion_time {
-                now.duration_since(dt).map(|a| a >= max_age).unwrap_or(false)
+                now.duration_since(dt)
+                    .map(|a| a >= max_age)
+                    .unwrap_or(false)
             } else {
                 false // skip items without date info when filtering by age
             };
@@ -849,12 +940,16 @@ fn cmd_empty(args: &[String]) -> ExitCode {
             }
             // Delete the file in trash
             let trash_path = tdir.join(&entry.trash_filename);
-            if trash_path.exists() {
-                if let Err(e) = libc_remove(&trash_path) {
-                    eprintln!("trash empty: failed to remove {}: {}", trash_path.display(), e);
-                    errors += 1;
-                    continue;
-                }
+            if trash_path.exists()
+                && let Err(e) = libc_remove(&trash_path)
+            {
+                eprintln!(
+                    "trash empty: failed to remove {}: {}",
+                    trash_path.display(),
+                    e
+                );
+                errors += 1;
+                continue;
             }
             // Delete the .trashinfo
             let info_path = idir.join(format!("{}.trashinfo", entry.trash_filename));
@@ -892,7 +987,11 @@ fn cmd_empty(args: &[String]) -> ExitCode {
         for entry in dir.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("trashinfo") {
-                let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let stem = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 if !tdir.join(&stem).exists() {
                     let _ = libc_remove(&path);
                 }
@@ -984,7 +1083,9 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     } else {
         // Multiple matches — prompt user
         if !is_tty() {
-            eprintln!("trash restore: multiple matches, use more specific pattern or run interactively:");
+            eprintln!(
+                "trash restore: multiple matches, use more specific pattern or run interactively:"
+            );
             for m in &matches {
                 let path = if m.original_path.is_empty() {
                     &m.trash_filename
@@ -1044,14 +1145,12 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     // H-1: the original_path is decoded from a .trashinfo file that any
     // same-UID writer could have crafted. Reject traversal / non-absolute /
     // NUL before renaming trashed bytes onto it.
-    if from_metadata {
-        if let Err(why) = validate_restore_target(&target) {
-            eprintln!(
-                "trash restore: refusing unsafe restore path ({why}): {}",
-                target.display()
-            );
-            return ExitCode::from(1);
-        }
+    if from_metadata && let Err(why) = validate_restore_target(&target) {
+        eprintln!(
+            "trash restore: refusing unsafe restore path ({why}): {}",
+            target.display()
+        );
+        return ExitCode::from(1);
     }
 
     // Friendly pre-check. symlink_metadata (not exists) so a dangling symlink
@@ -1063,18 +1162,18 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     }
 
     // Create parent dirs
-    if let Some(parent) = target.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("trash restore: cannot create {}: {}", parent.display(), e);
-                return ExitCode::from(1);
-            }
-        }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!("trash restore: cannot create {}: {}", parent.display(), e);
+        return ExitCode::from(1);
     }
 
-    // H-3: move from trash back ATOMICALLY, refusing to overwrite. Closes the
-    // exists()->rename TOCTOU and any symlink-follow clobber of an existing
-    // file at the destination.
+    // H-3: move from trash back ATOMICALLY, refusing to overwrite. There is no
+    // exists()->rename window, and an existing file or symlink at the
+    // destination is never clobbered.
     let trash_path = trash_dir().join(&chosen.trash_filename);
     if let Err(e) = libc_rename_noreplace(&trash_path, &target) {
         if e.kind() == io::ErrorKind::AlreadyExists {
@@ -1101,7 +1200,11 @@ fn cmd_restore(args: &[String]) -> ExitCode {
     let info_path = info_dir().join(format!("{}.trashinfo", chosen.trash_filename));
     let _ = libc_remove(&info_path);
 
-    println!("Restored: {} -> {}", chosen.trash_filename, target.display());
+    println!(
+        "Restored: {} -> {}",
+        chosen.trash_filename,
+        target.display()
+    );
     ExitCode::SUCCESS
 }
 
@@ -1187,13 +1290,16 @@ fn find_new_trash_entry(
 
 /// Resolve a path for trashing WITHOUT resolving a symlink at the leaf.
 ///
-/// H-4: `path.canonicalize()` resolves every symlink, so `trash mylink`
-/// (mylink -> /important/data) would canonicalize to /important/data and
-/// trash the *target*, diverging from `rm` semantics (which removes only the
-/// link) and recording the resolved target as `original_path` so a later
-/// restore writes to the wrong file. Instead, canonicalize only the parent
-/// directory and re-attach the original leaf name, so a symlink leaf is
-/// passed through untouched (`trash::delete` preserves symlink semantics).
+/// H-4: only the parent directory is canonicalized and the original leaf name
+/// re-attached. Canonicalizing the whole path would turn `trash mylink`
+/// (mylink -> /important/data) into trashing the *target* — unlike `rm`,
+/// which removes only the link — and record the target as `original_path`,
+/// so a later restore would write to the wrong place. `trash::delete` also
+/// canonicalizes only the parent, so the link itself is what gets trashed.
+///
+/// A path with no final name component — `.`, `..`, `/`, `dir/..` — is
+/// refused, as `rm` refuses it: resolving it would name the current
+/// directory, a parent of it, or the root.
 #[cfg(not(target_os = "windows"))]
 fn resolve_for_trash(path: &Path) -> io::Result<PathBuf> {
     match (path.parent(), path.file_name()) {
@@ -1208,9 +1314,10 @@ fn resolve_for_trash(path: &Path) -> io::Result<PathBuf> {
             };
             Ok(base.join(name))
         }
-        // No file_name: "/", ".", "..", or a trailing-slash root. These are
-        // never valid trash targets; let canonicalize produce the error.
-        _ => path.canonicalize(),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to trash '.', '..' or '/'",
+        )),
     }
 }
 
@@ -1250,7 +1357,11 @@ fn main() -> ExitCode {
 
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         print_help();
-        return if args.is_empty() { ExitCode::from(1) } else { ExitCode::SUCCESS };
+        return if args.is_empty() {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
     }
 
     if args[0] == "--version" || args[0] == "-V" {
@@ -1259,8 +1370,6 @@ fn main() -> ExitCode {
     }
 
     // M-3: refuse to run with an unsafe HOME before computing any trash path.
-    // A missing/relative HOME previously fell back to world-writable /tmp,
-    // which any local user could pre-plant with symlinks to weaponize H-1/H-2.
     #[cfg(not(target_os = "windows"))]
     if let Err(why) = validate_home() {
         eprintln!("trash: {why}; refusing to run (set HOME to an absolute path)");
@@ -1280,7 +1389,7 @@ fn main() -> ExitCode {
         }
     }
 
-    // ── Existing trash-files logic ───────────────────────────────
+    // ── Trash the given paths ────────────────────────────────────
     let mut dry_run = false;
     let mut verbose = false;
     let mut force = false;
@@ -1294,14 +1403,14 @@ fn main() -> ExitCode {
             "-v" | "--verbose" => verbose = true,
             "-f" | "--force" => force = true,
             "--allow-long-paths" => allow_long_paths = true,
-            "-r" | "-rf" | "-R" => {} // accept and ignore — directories are always handled
+            "-r" | "-R" => {} // rm compatibility: directories are always handled
             "--" => {
                 // everything after -- is a path
                 paths.extend(args[i + 1..].iter().map(PathBuf::from));
                 break;
             }
             s if s.starts_with('-') && !s.starts_with("--") && s.len() > 1 => {
-                // combined flags like -nv, -vf, -nvf
+                // combined flags like -nv, -rf, -nvf
                 for c in s[1..].chars() {
                     match c {
                         'n' => dry_run = true,
@@ -1419,16 +1528,15 @@ fn main() -> ExitCode {
                 // Write .trashinfo on macOS
                 #[cfg(target_os = "macos")]
                 {
-                    if let Some(trash_name) =
-                        find_new_trash_entry(&before_snapshot, &expected_name)
+                    if let Some(trash_name) = find_new_trash_entry(&before_snapshot, &expected_name)
                     {
-                        if let Err(e) = write_trash_info(&trash_name, &canonical) {
-                            if verbose {
-                                eprintln!(
-                                    "trash: warning: failed to write metadata for {}: {}",
-                                    trash_name, e
-                                );
-                            }
+                        if let Err(e) = write_trash_info(&trash_name, &canonical)
+                            && verbose
+                        {
+                            eprintln!(
+                                "trash: warning: failed to write metadata for {}: {}",
+                                trash_name, e
+                            );
                         }
                     } else if verbose {
                         eprintln!(
@@ -1548,8 +1656,14 @@ mod tests {
             // Refuse to run a destructive test anywhere but a fresh temp dir.
             assert!(dir.starts_with(std::env::temp_dir()));
             let ds = dir.to_string_lossy();
-            assert!(!ds.contains("ai-trash/src"), "scratch must not be in the repo");
-            assert!(!ds.contains("/.Trash"), "scratch must not be the real trash");
+            assert!(
+                !ds.contains("ai-trash/src"),
+                "scratch must not be in the repo"
+            );
+            assert!(
+                !ds.contains("/.Trash"),
+                "scratch must not be the real trash"
+            );
             fs::create_dir_all(&dir).unwrap();
             Scratch(dir)
         }
@@ -1564,10 +1678,9 @@ mod tests {
     }
 
     // ── H-2: symlink traversal on remove ────────────────────────────
-    // Discriminates the real bug class: swapping `symlink_metadata` for
-    // `metadata`/`is_dir` (which follow the link) makes `libc_remove` recurse
-    // through `badlink` into `victim` and delete `precious`. Verified by
-    // mutation (temporarily reverting the guard fails this test).
+    // Discriminates the real bug class: with `metadata` in place of
+    // `symlink_metadata` (following the link), `libc_remove` recurses through
+    // `badlink` into `victim` and deletes `precious`; this test fails.
     #[test]
     fn h2_remove_does_not_follow_symlink_to_outside_dir() {
         let s = Scratch::new("h2");
@@ -1583,16 +1696,28 @@ mod tests {
 
         // Remove the symlink directly: only the link must go.
         libc_remove(&badlink).unwrap();
-        assert!(fs::symlink_metadata(&badlink).is_err(), "symlink should be gone");
-        assert!(precious.exists(), "H-2: file behind the symlink must survive");
+        assert!(
+            fs::symlink_metadata(&badlink).is_err(),
+            "symlink should be gone"
+        );
+        assert!(
+            precious.exists(),
+            "H-2: file behind the symlink must survive"
+        );
 
         // Now remove the whole trash-like dir (recursion path) with a fresh
         // symlink inside it: the walk must still not follow into victim.
         let badlink2 = trashlike.join("badlink2");
         std::os::unix::fs::symlink(&victim, &badlink2).unwrap();
         libc_remove(&trashlike).unwrap();
-        assert!(trashlike.symlink_metadata().is_err(), "trash dir should be gone");
-        assert!(precious.exists(), "H-2: victim must survive recursive empty");
+        assert!(
+            trashlike.symlink_metadata().is_err(),
+            "trash dir should be gone"
+        );
+        assert!(
+            precious.exists(),
+            "H-2: victim must survive recursive empty"
+        );
         assert!(victim.exists());
     }
 
@@ -1615,7 +1740,10 @@ mod tests {
         assert_ne!(resolved, target.canonicalize().unwrap());
         // A regular (non-symlink) leaf still resolves fine.
         let plain = resolve_for_trash(&target).unwrap();
-        assert_eq!(plain.file_name().unwrap(), std::ffi::OsStr::new("target.txt"));
+        assert_eq!(
+            plain.file_name().unwrap(),
+            std::ffi::OsStr::new("target.txt")
+        );
     }
 
     // ── H-1: restore target validation ──────────────────────────────
@@ -1650,6 +1778,40 @@ mod tests {
         libc_rename_noreplace(&from, &fresh).unwrap();
         assert_eq!(fs::read(&fresh).unwrap(), b"new");
         assert!(!from.exists());
+    }
+
+    // ── .trashinfo Path= encoding ───────────────────────────────────
+    #[test]
+    fn trashinfo_path_round_trips_and_cannot_inject_a_line() {
+        let hostile = "/Users/victim/a b%41\nPath=/etc/x";
+        let enc = percent_encode(hostile.as_bytes());
+        assert!(
+            !enc.contains('\n'),
+            "a newline must not reach the file: {enc}"
+        );
+        assert_eq!(percent_decode(&enc), hostile);
+        assert_eq!(
+            percent_encode(b"/Users/victim/ok-1.txt"),
+            "/Users/victim/ok-1.txt"
+        );
+        // A '%' not followed by two hex digits is kept literally.
+        assert_eq!(percent_decode("100%+1"), "100%+1");
+        assert_eq!(percent_decode("%4"), "%4");
+    }
+
+    // ── `.`, `..` and `/` are never trash targets ───────────────────
+    #[test]
+    fn resolve_refuses_paths_without_a_final_name() {
+        for p in [".", "..", "/", "./", "a/.."] {
+            assert!(
+                resolve_for_trash(Path::new(p)).is_err(),
+                "{p} must be refused"
+            );
+        }
+        let s = Scratch::new("dotname");
+        let named = s.path().join("x");
+        fs::write(&named, b"").unwrap();
+        assert!(resolve_for_trash(&named).is_ok());
     }
 
     // ── M-2: parse_iso_datetime must not panic on multi-byte input ──
@@ -1732,15 +1894,17 @@ mod tests {
         );
         let near_limit = PATH_MAX_BYTES - TRASH_NAME_MARGIN - 4;
         match scan_for_long_paths(s.path(), near_limit) {
-            LongPath::TooLong { why: Why::WouldExceed, .. } => {}
+            LongPath::TooLong {
+                why: Why::WouldExceed,
+                ..
+            } => {}
             _ => panic!("a tree that would not fit at the destination must be refused"),
         }
     }
 
     #[test]
     fn the_margin_reserves_room_for_the_collision_suffix() {
-        // Finder and this tool both disambiguate a name collision by appending
-        // a timestamp. A tree that fits EXACTLY stops fitting once renamed, so
+        // Finder disambiguates a name collision by appending a timestamp. A tree that fits EXACTLY stops fitting once renamed, so
         // the guard must refuse before the arithmetic reaches zero bytes spare.
         let s = Scratch::new("pm-margin");
         fs::create_dir(s.path().join("xx")).unwrap();
@@ -1751,23 +1915,29 @@ mod tests {
         let child_len = snug + 1 + 2; // "/xx"
         assert!(child_len <= PATH_MAX_BYTES, "the child fits unaided");
         assert!(
-            matches!(scan_for_long_paths(s.path(), snug), LongPath::TooLong { .. }),
+            matches!(
+                scan_for_long_paths(s.path(), snug),
+                LongPath::TooLong { .. }
+            ),
             "the collision suffix has to be accounted for"
         );
     }
 
     #[test]
     fn a_tree_deeper_than_a_path_can_express_is_caught_rather_than_walked_past() {
-        // The regression that matters. A first cut treated the scan's own
-        // ENAMETOOLONG as "unreadable, skip it" and walked straight past the
-        // only thing worth finding — reproducing, inside the guard, the exact
-        // failure the guard exists to prevent.
+        // The scan's own read_dir fails with ENAMETOOLONG on exactly this
+        // tree. Treating that as "unreadable, skip it" would walk straight
+        // past the only thing worth finding — reproducing, inside the guard,
+        // the failure the guard exists to prevent.
         let s = Scratch::new("pm-unreachable");
         nest(s.path(), 510);
         let verdict = scan_for_long_paths(s.path(), 30);
         wipe(s.path());
         match verdict {
-            LongPath::TooLong { why: Why::AlreadyUnreachable, .. } => {}
+            LongPath::TooLong {
+                why: Why::AlreadyUnreachable,
+                ..
+            } => {}
             _ => panic!("a tree that cannot be opened where it sits must be refused"),
         }
     }
@@ -1778,7 +1948,11 @@ mod tests {
         // almost always the cause. A path this long is unreadable otherwise.
         let p = PathBuf::from(format!("/tmp/deepx/{}", "d/".repeat(400)));
         let e = elide_path(&p);
-        assert!(e.chars().count() < 130, "elided to {} chars", e.chars().count());
+        assert!(
+            e.chars().count() < 130,
+            "elided to {} chars",
+            e.chars().count()
+        );
         assert!(e.starts_with("/tmp/deepx/"), "keeps the head: {e}");
         assert!(e.contains('…'), "marks the elision: {e}");
     }
