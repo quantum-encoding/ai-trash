@@ -1288,6 +1288,34 @@ fn find_new_trash_entry(
 
 // ── Path resolution / validation ────────────────────────────────────
 
+/// Move one path to the trash.
+///
+/// On macOS this asks NSFileManager directly instead of taking the crate's
+/// default, which shells out to `osascript` to drive Finder. That default
+/// resolves `osascript` through PATH (trash-5.2.5 src/macos/mod.rs:116), so any
+/// directory earlier on PATH than /usr/bin decides what runs on every single
+/// delete — the same hijack M-1 removed for `date`. Asking the framework runs no
+/// subprocess at all, so the question does not arise.
+///
+/// It is also the better call on its own merits here: no automation-permission
+/// prompt (the Finder route can ask, which strands a headless run), no Finder
+/// sound, and faster. What it gives up is Finder's right-click "Put Back" —
+/// which this tool never relied on, because `trash restore` works from the
+/// .trashinfo records written below.
+fn delete_one(path: &std::path::Path) -> Result<(), trash::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::default();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path)
+    }
+}
+
 /// Resolve a path for trashing WITHOUT resolving a symlink at the leaf.
 ///
 /// H-4: only the parent directory is canonicalized and the original leaf name
@@ -1520,7 +1548,7 @@ fn main() -> ExitCode {
             .to_string_lossy()
             .to_string();
 
-        match trash::delete(&canonical) {
+        match delete_one(&canonical) {
             Ok(()) => {
                 if verbose {
                     println!("trashed: {}", canonical.display());
